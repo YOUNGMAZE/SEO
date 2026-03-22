@@ -5,10 +5,29 @@ type VideoPlatform = "youtube" | "shorts" | "tiktok";
 type TopResult = { title: string; url: string; query: string; kind: "video" | "site" };
 type SourceData = { suggestions: string[]; tags: string[]; score: number; top?: TopResult; error?: string };
 type ResultMap = Partial<Record<Source, SourceData>>;
+type ChannelPlatform = "youtube" | "tiktok";
+type ChannelItem = {
+  platform: ChannelPlatform;
+  name: string;
+  url: string;
+  followers?: string;
+  score: number;
+};
 type TitleCandidate = { text: string; score: number };
 type RankedTitleCandidate = TitleCandidate & { last: string };
 type QueryCandidate = { text: string; score: number };
 type MusicTrack = { title: string; url: string; query: string; score: number; reason: string };
+type VideoSeoAnalysis = {
+  platform: VideoPlatform;
+  url: string;
+  title: string;
+  author: string;
+  description: string;
+  tags: string[];
+  score: number;
+  recommendations: string[];
+  improvedTitles: string[];
+};
 type AnalyticsReport = {
   intent: string;
   competition: { score: number; label: string };
@@ -1423,6 +1442,215 @@ const parseTikTokTopFromSearchEngine = (raw: string, query: string): TopResult |
   };
 };
 
+const parseFollowerWeight = (value: string) => {
+  const t = clean(value).replace(/,/g, ".");
+  const n = Number(t.match(/\d+(?:\.\d+)?/)?.[0] || "0");
+  if (!n) return 0;
+  if (/[mb]n|млн|million|m\b/.test(t)) return n * 1000000;
+  if (/тыс|k\b/.test(t)) return n * 1000;
+  return n;
+};
+
+const fetchPopularYoutubeChannels = async (query: string): Promise<ChannelItem[]> => {
+  const html = await fetchThroughProxies(
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAg%253D%253D`
+  );
+  const blocks = [...html.matchAll(/"channelRenderer":\{([\s\S]*?)\},"trackingParams"/g)].slice(0, 24);
+  const picked = blocks
+    .map((m, i) => {
+      const chunk = m[1];
+      const title =
+        unescapeJsonText(chunk.match(/"title":\{"simpleText":"([^"]+)"/)?.[1] || "") ||
+        unescapeJsonText(chunk.match(/"title":\{"runs":\[\{"text":"([^"]+)"/)?.[1] || "");
+      const handle = unescapeJsonText(chunk.match(/"canonicalBaseUrl":"(\\\/@[^"]+)"/)?.[1] || "").replace(/\\\//g, "/");
+      const channelId = chunk.match(/"channelId":"([^"]+)"/)?.[1] || "";
+      const followers =
+        unescapeJsonText(chunk.match(/"subscriberCountText":\{"simpleText":"([^"]+)"/)?.[1] || "") ||
+        unescapeJsonText(chunk.match(/"subscriberCountText":\{"runs":\[\{"text":"([^"]+)"/)?.[1] || "");
+      const url = handle ? `https://www.youtube.com${handle}` : channelId ? `https://www.youtube.com/channel/${channelId}` : "";
+      if (!title || !url) return null;
+      const rel = tokenOverlapRatio(`${title} ${query}`, query) * 100;
+      const followerWeight = Math.log10(parseFollowerWeight(followers) + 10) * 12;
+      const score = rel + followerWeight + Math.max(0, 10 - i);
+      return { platform: "youtube", name: title, url, followers, score } as ChannelItem;
+    })
+    .filter(Boolean) as ChannelItem[];
+
+  if (picked.length) {
+    return unique(picked.map((c) => c.url))
+      .map((url) => picked.find((c) => c.url === url)!)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+  }
+
+  // Fallback if channelRenderer is hidden in proxied response.
+  return unique([...html.matchAll(/"url":"\\\/@([a-zA-Z0-9._-]{3,40})"/g)].map((m) => m[1]))
+    .slice(0, 8)
+    .map((handle, i) => ({
+      platform: "youtube" as const,
+      name: `@${handle}`,
+      url: `https://www.youtube.com/@${handle}`,
+      score: 70 - i,
+    }));
+};
+
+const fetchPopularTikTokChannels = async (query: string): Promise<ChannelItem[]> => {
+  const endpoints = [
+    `https://www.tiktok.com/api/search/user/full/?keyword=${encodeURIComponent(query)}&from_source=search_box`,
+    `https://www.tiktok.com/search/user?q=${encodeURIComponent(query)}`,
+  ];
+  let out: ChannelItem[] = [];
+  for (const endpoint of endpoints) {
+    for (const url of proxyUrls(endpoint)) {
+      try {
+        const raw = await fetchText(url);
+        const data = parseLooseJson(raw);
+        const stack: unknown[] = data ? [data] : [];
+        let guard = 0;
+        while (stack.length && guard < 1800) {
+          guard += 1;
+          const cur = stack.pop();
+          if (!cur || typeof cur !== "object") continue;
+          const obj = cur as Record<string, unknown>;
+          const uid = String((obj.unique_id || obj.uniqueId || obj.sec_uid || "") as string).trim();
+          const nickname = String((obj.nickname || obj.nick_name || obj.title || "") as string).trim();
+          const follower = String((obj.follower_count || obj.followerCount || obj.fans || "") as string).trim();
+          if (uid && uid.length > 1) {
+            const name = nickname ? `${nickname} (@${uid})` : `@${uid}`;
+            const rel = tokenOverlapRatio(`${name} ${query}`, query) * 100;
+            const score = rel + Math.log10((Number(follower) || 0) + 10) * 12;
+            out.push({ platform: "tiktok", name, url: `https://www.tiktok.com/@${uid}`, followers: follower, score });
+          }
+          Object.values(obj).forEach((v) => v && typeof v === "object" && stack.push(v));
+        }
+
+        const regexUsers = unique([
+          ...[...raw.matchAll(/https?:\/\/www\.tiktok\.com\/@([a-zA-Z0-9._-]{2,40})/g)].map((m) => m[1]),
+          ...[...raw.matchAll(/"unique_id"\s*:\s*"([a-zA-Z0-9._-]{2,40})"/g)].map((m) => m[1]),
+        ]);
+        regexUsers.slice(0, 12).forEach((uid, i) => {
+          out.push({
+            platform: "tiktok",
+            name: `@${uid}`,
+            url: `https://www.tiktok.com/@${uid}`,
+            score: tokenOverlapRatio(uid, query) * 100 + (8 - i),
+          });
+        });
+
+        if (out.length >= 8) break;
+      } catch {
+        // Next proxy.
+      }
+    }
+    if (out.length >= 8) break;
+  }
+  return unique(out.map((x) => x.url))
+    .map((url) => out.find((x) => x.url === url)!)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+};
+
+const analyzeVideoByLink = async (url: string): Promise<VideoSeoAnalysis> => {
+  const src = url.trim();
+  if (!src) throw new Error("Введите ссылку на видео");
+  const isYt = /youtu\.be|youtube\.com/i.test(src);
+  const isTikTok = /tiktok\.com/i.test(src);
+  if (!isYt && !isTikTok) throw new Error("Поддерживаются только YouTube и TikTok ссылки");
+
+  if (isYt) {
+    const id = getYoutubeId(src);
+    if (!id) throw new Error("Не удалось определить YouTube video ID");
+    const canonical = `https://www.youtube.com/watch?v=${id}`;
+    const oembedRaw = await fetchThroughProxies(
+      `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`
+    );
+    const meta = (parseLooseJson(oembedRaw) || {}) as Record<string, unknown>;
+    const title = String(meta.title || "").trim() || "YouTube video";
+    const author = String(meta.author_name || "").trim() || "Unknown author";
+    let description = "";
+    let tags: string[] = [];
+    try {
+      const html = await fetchThroughProxies(canonical);
+      description =
+        unescapeJsonText(html.match(/"shortDescription":"([\s\S]*?)","isCrawlable"/)?.[1] || "")
+          .replace(/\\n/g, " ")
+          .slice(0, 320) || "";
+      const kwRaw = html.match(/"keywords":\[([^\]]*)\]/)?.[1] || "";
+      tags = unique([...kwRaw.matchAll(/"([^"]+)"/g)].map((m) => `#${deTag(m[1]).replace(/\s+/g, "_")}`)).slice(0, 12);
+    } catch {
+      // Metadata already enough for analysis.
+    }
+
+    const related = await jsonp(
+      `https://suggestqueries.google.com/complete/search?client=chrome&ds=yt&hl=ru&gl=ru&q=${encodeURIComponent(title)}`
+    ).catch(() => [] as string[]);
+    const trend = buildWordWeight(related.length ? related : [title], 1.4);
+    const score = textSeoScore(title, title, trend);
+    const titleWords = tokenize(title);
+    const recs = [
+      titleWords.length < 5 ? "Увеличьте длину названия до 6-10 слов для более точного SEO-интента." : "Длина названия в рабочем диапазоне для поиска.",
+      score < 60 ? "Добавьте в начало названия главный ключ и конкретную выгоду пользователя." : "Название достаточно релевантно запросному кластеру.",
+      tags.length < 5 ? "Добавьте 8-12 релевантных тегов, включая long-tail формулировки." : "Теги присутствуют, проверьте первые 5 на точное ядро.",
+      !/(как|гайд|обзор|shorts|тренд|пошагово)/i.test(clean(title))
+        ? "Добавьте intent-слово (как, обзор, гайд, shorts, тренд) для роста CTR и релевантности."
+        : "Intent-слова в названии уже помогают ранжированию.",
+    ];
+    const improvedTitles = buildPromotedQueries(title, title, related, [], tags)
+      .slice(0, 4)
+      .map((x) => cap(sanitizeTitle(x.text)));
+
+    return {
+      platform: src.includes("/shorts/") ? "shorts" : "youtube",
+      url: canonical,
+      title,
+      author,
+      description,
+      tags,
+      score,
+      recommendations: recs,
+      improvedTitles,
+    };
+  }
+
+  const html = await fetchThroughProxies(src);
+  const title =
+    unescapeJsonText(html.match(/"desc":"([^"]{4,220})"/)?.[1] || "") ||
+    unescapeJsonText(html.match(/<title>([^<]{4,220})<\/title>/i)?.[1] || "") ||
+    "TikTok video";
+  const author =
+    unescapeJsonText(html.match(/"nickname":"([^"]{2,120})"/)?.[1] || "") ||
+    unescapeJsonText(html.match(/"uniqueId":"([^"]{2,80})"/)?.[1] || "") ||
+    "TikTok author";
+  const hashtags = unique([...html.matchAll(/#([\p{L}\p{N}_]{2,40})/gu)].map((m) => `#${m[1]}`)).slice(0, 12);
+  const related = await jsonp(
+    `https://suggestqueries.google.com/complete/search?client=chrome&hl=ru&gl=ru&q=${encodeURIComponent(`${title} tiktok`)}`
+  ).catch(() => [] as string[]);
+  const trend = buildWordWeight(related.length ? related : [title], 1.35);
+  const score = textSeoScore(title, title, trend);
+  const recs = [
+    score < 58 ? "Добавьте в первые 4-6 слов названия главный запрос и формат ролика." : "Текст ролика хорошо совпадает с live-подсказками.",
+    hashtags.length < 4 ? "Увеличьте число целевых хэштегов до 5-8 и добавьте 2 long-tail тега." : "Хэштеги присутствуют, держите баланс между широкими и узкими.",
+    !/(тренд|вирус|лайфхак|челлендж|short)/i.test(clean(title))
+      ? "Добавьте вирусный маркер (тренд, лайфхак, челлендж) для TikTok-интента."
+      : "TikTok-интент выражен, это плюс для рекомендаций.",
+  ];
+  const improvedTitles = buildPromotedQueries(title, title, related, [], hashtags)
+    .slice(0, 4)
+    .map((x) => cap(sanitizeTitle(x.text)));
+
+  return {
+    platform: "tiktok",
+    url: src,
+    title,
+    author,
+    description: "",
+    tags: hashtags,
+    score,
+    recommendations: recs,
+    improvedTitles,
+  };
+};
+
 const fetchGoogle = async (query: string): Promise<FetchPayload> => {
   const [suggestions, html] = await Promise.all([
     jsonp(`https://suggestqueries.google.com/complete/search?client=chrome&hl=ru&gl=ru&q=${encodeURIComponent(query)}`),
@@ -1828,12 +2056,18 @@ function TermHint({ term }: { term: keyof typeof GLOSSARY }) {
 
 export default function App() {
   const [query, setQuery] = useState("");
+  const [videoUrl, setVideoUrl] = useState("");
   const [loading, setLoading] = useState(false);
+  const [videoLoading, setVideoLoading] = useState(false);
   const [results, setResults] = useState<ResultMap>({});
+  const [popularChannels, setPopularChannels] = useState<Record<ChannelPlatform, ChannelItem[]>>({ youtube: [], tiktok: [] });
+  const [channelTab, setChannelTab] = useState<ChannelPlatform>("youtube");
   const [generated, setGenerated] = useState<GeneratedData | null>(null);
+  const [videoAnalysis, setVideoAnalysis] = useState<VideoSeoAnalysis | null>(null);
   const [selectedTitles, setSelectedTitles] = useState<Partial<Record<VideoPlatform, string>>>({});
   const [selectedQuery, setSelectedQuery] = useState("");
   const [appError, setAppError] = useState("");
+  const [videoError, setVideoError] = useState("");
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [etaSeconds, setEtaSeconds] = useState(0);
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -1916,9 +2150,17 @@ export default function App() {
       const analytics = buildAnalytics(q, next, allSuggestions, tops, improvedTagsText, bestQuery, bestTitles, queryOptions);
       completedWeight = Math.max(completedWeight, 0.78);
       updateProgress();
+      const [ytChannels, ttChannels] = await Promise.allSettled([
+        track(fetchPopularYoutubeChannels(q), 0.09),
+        track(fetchPopularTikTokChannels(q), 0.09),
+      ]);
       const musicTracks = await track(fetchMusicRecommendations(q, bestQuery, analytics), 0.2);
 
       setResults(next);
+      setPopularChannels({
+        youtube: ytChannels.status === "fulfilled" ? ytChannels.value : [],
+        tiktok: ttChannels.status === "fulfilled" ? ttChannels.value : [],
+      });
       setGenerated({
         improvedQuery: bestQuery,
         improvedTags: improvedTagsText,
@@ -1940,6 +2182,22 @@ export default function App() {
       setEtaSeconds(0);
       setLoading(false);
       window.setTimeout(() => setAnalysisProgress(0), 800);
+    }
+  };
+
+  const runVideoAnalysis = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!videoUrl.trim()) return;
+    setVideoLoading(true);
+    setVideoError("");
+    try {
+      const report = await analyzeVideoByLink(videoUrl);
+      setVideoAnalysis(report);
+    } catch (err) {
+      setVideoError(err instanceof Error ? err.message : "Не удалось проанализировать ссылку");
+      setVideoAnalysis(null);
+    } finally {
+      setVideoLoading(false);
     }
   };
 
@@ -1978,7 +2236,74 @@ export default function App() {
             {loading ? "Анализ..." : "Анализировать"}
           </button>
         </form>
+        <form onSubmit={runVideoAnalysis} className="glass-soft liquid-card-soft fade-up flex flex-col gap-3 rounded-3xl p-3 md:flex-row md:p-4">
+          <input
+            value={videoUrl}
+            onChange={(e) => setVideoUrl(e.target.value)}
+            placeholder="Вставьте ссылку на YouTube/TikTok видео для SEO-анализа"
+            className="glass-input h-12 flex-1 rounded-2xl px-4 text-base text-zinc-900 outline-none transition"
+          />
+          <button
+            disabled={videoLoading}
+            className="glass-btn h-12 rounded-2xl px-6 text-sm font-medium uppercase tracking-wide text-zinc-900 transition hover:bg-white/70 disabled:opacity-60"
+          >
+            {videoLoading ? "Проверка..." : "Анализ видео по ссылке"}
+          </button>
+        </form>
         {appError && <p className="glass-soft rounded-xl px-4 py-2 text-sm text-rose-700">{appError}</p>}
+        {videoError && <p className="glass-soft rounded-xl px-4 py-2 text-sm text-rose-700">{videoError}</p>}
+        {videoAnalysis && (
+          <section className="glass liquid-card fade-up rounded-3xl p-4 md:p-5">
+            <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-wide text-zinc-500">
+              <span>Анализ видео</span>
+              <span>•</span>
+              <span>{PLATFORM_LABEL[videoAnalysis.platform]}</span>
+              <span>•</span>
+              <span>SEO score: {videoAnalysis.score}%</span>
+            </div>
+            <h3 className="mt-2 text-xl font-medium text-zinc-900">{videoAnalysis.title}</h3>
+            <p className="text-sm text-zinc-600">Автор: {videoAnalysis.author}</p>
+            {!!videoAnalysis.description && <p className="mt-2 text-sm text-zinc-700">{videoAnalysis.description}</p>}
+            {!!videoAnalysis.tags.length && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {videoAnalysis.tags.map((tag) => (
+                  <button
+                    key={tag}
+                    type="button"
+                    onClick={() => copyText(tag)}
+                    className="glass-chip rounded-xl px-2 py-1 text-xs text-zinc-700"
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="mt-4 grid gap-2 md:grid-cols-2">
+              {videoAnalysis.recommendations.map((row) => (
+                <p key={row} className="glass-soft liquid-card-soft rounded-xl px-3 py-2 text-xs text-zinc-700">
+                  {row}
+                </p>
+              ))}
+            </div>
+            {!!videoAnalysis.improvedTitles.length && (
+              <div className="mt-4 space-y-2">
+                <p className="text-sm text-zinc-600">Варианты улучшенного названия</p>
+                <div className="grid gap-2 md:grid-cols-2">
+                  {videoAnalysis.improvedTitles.map((row) => (
+                    <button
+                      key={row}
+                      type="button"
+                      onClick={() => copyText(row)}
+                      className="glass-soft liquid-card-soft rounded-xl px-3 py-2 text-left text-sm text-zinc-800"
+                    >
+                      {row}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
         {(loading || analysisProgress > 0) && (
           <div className="glass-soft fade-up rounded-2xl px-4 py-3">
             <div className="mb-2 flex items-center justify-between text-sm text-zinc-600">
@@ -2101,6 +2426,46 @@ export default function App() {
             )}
           </article>
         </div>
+
+        <section className="glass liquid-card fade-up rounded-3xl p-4 md:p-5">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="text-xl font-medium">Популярные каналы по запросу</h3>
+            <div className="glass-soft inline-flex rounded-xl p-1">
+              {(["youtube", "tiktok"] as ChannelPlatform[]).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setChannelTab(tab)}
+                  className={`rounded-lg px-3 py-1.5 text-xs uppercase tracking-wide transition ${
+                    channelTab === tab ? "bg-white/85 text-zinc-900" : "text-zinc-600"
+                  }`}
+                >
+                  {tab === "youtube" ? "YouTube" : "TikTok"}
+                </button>
+              ))}
+            </div>
+          </div>
+          {!popularChannels[channelTab].length && (
+            <p className="text-sm text-zinc-500">После анализа запроса появится список наиболее подходящих каналов.</p>
+          )}
+          <div className="grid gap-2 md:grid-cols-2">
+            {popularChannels[channelTab].map((channel) => (
+              <div key={channel.url} className="glass-soft liquid-card-soft flex items-center justify-between gap-3 rounded-xl px-3 py-2">
+                <div>
+                  <a href={channel.url} target="_blank" rel="noreferrer" className="text-sm text-zinc-900 underline decoration-zinc-400/60 underline-offset-2">
+                    {channel.name}
+                  </a>
+                  <p className="text-xs text-zinc-500">
+                    {channel.followers ? `Аудитория: ${channel.followers}` : "Профиль по запросу"} · rel {Math.round(channel.score)}
+                  </p>
+                </div>
+                <button type="button" onClick={() => copyText(channel.url)} className="glass-btn rounded-lg px-3 py-1 text-xs uppercase tracking-wide text-zinc-900">
+                  Копировать
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
 
         {generated && (
           <section className="glass liquid-card fade-up space-y-4 rounded-3xl p-4 md:p-5">
