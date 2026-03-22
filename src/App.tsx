@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Source = "google" | "youtube" | "shorts" | "tiktok";
 type VideoPlatform = "youtube" | "shorts" | "tiktok";
@@ -1834,6 +1834,19 @@ export default function App() {
   const [selectedTitles, setSelectedTitles] = useState<Partial<Record<VideoPlatform, string>>>({});
   const [selectedQuery, setSelectedQuery] = useState("");
   const [appError, setAppError] = useState("");
+  const [analysisProgress, setAnalysisProgress] = useState(0);
+  const [etaSeconds, setEtaSeconds] = useState(0);
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") return "light";
+    const stored = window.localStorage.getItem("maze-theme");
+    if (stored === "light" || stored === "dark") return stored;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("maze-theme", theme);
+  }, [theme]);
 
   const overall = useMemo(() => {
     const values = Object.values(results).filter((r) => r?.score).map((r) => r!.score);
@@ -1847,12 +1860,31 @@ export default function App() {
     setLoading(true);
     setAppError("");
     setGenerated(null);
+    setAnalysisProgress(4);
+    setEtaSeconds(18);
+    const startedAt = Date.now();
+    const expectedMs = 18000;
+    let completedWeight = 0;
+    const updateProgress = () => {
+      const elapsed = Date.now() - startedAt;
+      const timed = (elapsed / expectedMs) * 62;
+      const completed = completedWeight * 100;
+      const next = clamp(Math.round(Math.max(timed, completed, 4)), 0, 97);
+      setAnalysisProgress((prev) => Math.max(prev, next));
+      setEtaSeconds(Math.max(0, Math.round((expectedMs - elapsed) / 1000)));
+    };
+    const track = <T,>(promise: Promise<T>, weight: number) =>
+      promise.finally(() => {
+        completedWeight += weight;
+        updateProgress();
+      });
+    const timer = window.setInterval(updateProgress, 250);
     try {
       const [google, youtube, shorts, tiktok] = await Promise.allSettled([
-        fetchGoogle(q),
-        fetchYoutube(q),
-        fetchYoutubeShorts(q),
-        fetchTiktok(q),
+        track(fetchGoogle(q), 0.17),
+        track(fetchYoutube(q), 0.17),
+        track(fetchYoutubeShorts(q), 0.17),
+        track(fetchTiktok(q), 0.17),
       ]);
 
       const asData = (source: Source, res: PromiseSettledResult<FetchPayload>): SourceData =>
@@ -1882,7 +1914,9 @@ export default function App() {
       const { titlesByPlatform, bestTitles } = buildPlatformTitles(q, bestQuery, next, improvedTagsText, tops);
       const bestTitle = bestTitles.youtube;
       const analytics = buildAnalytics(q, next, allSuggestions, tops, improvedTagsText, bestQuery, bestTitles, queryOptions);
-      const musicTracks = await fetchMusicRecommendations(q, bestQuery, analytics);
+      completedWeight = Math.max(completedWeight, 0.78);
+      updateProgress();
+      const musicTracks = await track(fetchMusicRecommendations(q, bestQuery, analytics), 0.2);
 
       setResults(next);
       setGenerated({
@@ -1901,16 +1935,29 @@ export default function App() {
     } catch (err) {
       setAppError(err instanceof Error ? err.message : "Не удалось завершить анализ");
     } finally {
+      window.clearInterval(timer);
+      setAnalysisProgress(100);
+      setEtaSeconds(0);
       setLoading(false);
+      window.setTimeout(() => setAnalysisProgress(0), 800);
     }
   };
 
   return (
-    <main className="relative min-h-screen overflow-hidden text-zinc-900">
+    <main className={`theme-${theme} relative min-h-screen overflow-hidden text-zinc-900`}>
       <div className="aurora pointer-events-none absolute inset-[-8%] opacity-65" />
       <section className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-5 py-8 md:py-12">
         <header className="glass liquid-card fade-up rounded-[2rem] p-6 md:p-9">
-          <p className="text-xs tracking-[0.28em] text-zinc-500">LIVE SEO ANALYTICS</p>
+          <div className="flex items-start justify-between gap-4">
+            <p className="text-xs tracking-[0.28em] text-zinc-500">LIVE SEO ANALYTICS</p>
+            <button
+              type="button"
+              onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
+              className="glass-btn rounded-xl px-3 py-2 text-xs font-medium uppercase tracking-wide text-zinc-900"
+            >
+              {theme === "light" ? "Темная тема" : "Светлая тема"}
+            </button>
+          </div>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight text-zinc-900 md:text-6xl">MAZE TAGS</h1>
           <p className="mt-3 max-w-3xl text-zinc-600">
             Реальный анализ релевантности запроса, подбор тегов и SEO-названий для Google Search, YouTube, Shorts и TikTok.
@@ -1932,6 +1979,17 @@ export default function App() {
           </button>
         </form>
         {appError && <p className="glass-soft rounded-xl px-4 py-2 text-sm text-rose-700">{appError}</p>}
+        {(loading || analysisProgress > 0) && (
+          <div className="glass-soft fade-up rounded-2xl px-4 py-3">
+            <div className="mb-2 flex items-center justify-between text-sm text-zinc-600">
+              <span>Прогресс live-анализа</span>
+              <span>{analysisProgress}% {loading ? `· ~${etaSeconds} c` : ""}</span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-zinc-200/70">
+              <div className="progress-stripe h-full rounded-full bg-zinc-800 transition-all duration-500" style={{ width: `${analysisProgress}%` }} />
+            </div>
+          </div>
+        )}
 
         <div className="glass-soft liquid-card-soft fade-up flex items-center gap-4 rounded-2xl px-4 py-3">
           <span className="text-sm text-zinc-600">Итоговая релевантность</span>
